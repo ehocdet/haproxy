@@ -516,7 +516,14 @@ ifneq ($(USE_OPENSSL),)
 # pass it in the "ADDLIB" variable if needed. If your SSL libraries are not
 # in the usual path, use SSL_INC=/path/to/inc and SSL_LIB=/path/to/lib.
 OPTIONS_CFLAGS  += $(if $(SSL_INC),-I$(SSL_INC))
+ifneq ($(BORINGSSL_PATH),)
+OPTIONS_CFLAGS += -I$(BORINGSSL_PATH)/include
+OPTIONS_LDFLAGS += -L$(BORINGSSL_PATH)/build/ssl -lssl
+OPTIONS_LDFLAGS += -L$(BORINGSSL_PATH)/build/crypto -lcrypto
+OPTIONS_LDFLAGS += -lpthread
+else
 OPTIONS_LDFLAGS += $(if $(SSL_LIB),-L$(SSL_LIB)) -lssl -lcrypto
+endif
 ifneq ($(USE_DL),)
 OPTIONS_LDFLAGS += -ldl
 endif
