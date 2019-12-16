@@ -4394,6 +4394,8 @@ void ssl_sock_free_ssl_conf(struct ssl_bind_conf *conf)
 #endif
 		free(conf->ca_file);
 		conf->ca_file = NULL;
+		free(conf->ca_no_names_file);
+		conf->ca_no_names_file = NULL;
 		free(conf->crl_file);
 		conf->crl_file = NULL;
 		free(conf->ciphers);
@@ -5013,15 +5015,21 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_conf *ssl_
 	SSL_CTX_set_verify(ctx, verify, ssl_sock_bind_verifycbk);
 	if (verify & SSL_VERIFY_PEER) {
 		char *ca_file = (ssl_conf && ssl_conf->ca_file) ? ssl_conf->ca_file : bind_conf->ssl_conf.ca_file;
+		char *ca_no_names_file = (ssl_conf && ssl_conf->ca_no_names_file) ? ssl_conf->ca_no_names_file : bind_conf->ssl_conf.ca_no_names_file;
 		char *crl_file = (ssl_conf && ssl_conf->crl_file) ? ssl_conf->crl_file : bind_conf->ssl_conf.crl_file;
-		if (ca_file) {
+		if (ca_file || ca_no_names_file) {
 			/* set CAfile to verify */
-			if (!ssl_set_verify_locations_file(ctx, ca_file)) {
+			if (ca_file && !ssl_set_verify_locations_file(ctx, ca_file)) {
 				memprintf(err, "%sProxy '%s': unable to set CA file '%s' for bind '%s' at [%s:%d].\n",
 				          err && *err ? *err : "", curproxy->id, ca_file, bind_conf->arg, bind_conf->file, bind_conf->line);
 				cfgerr |= ERR_ALERT | ERR_FATAL;
 			}
-			if (!((ssl_conf && ssl_conf->no_ca_names) || bind_conf->ssl_conf.no_ca_names)) {
+			if (ca_no_names_file && !ssl_set_verify_locations_file(ctx, ca_no_names_file)) {
+				memprintf(err, "%sProxy '%s': unable to set CA-no-names file '%s' for bind '%s' at [%s:%d].\n",
+				          err && *err ? *err : "", curproxy->id, ca_no_names_file, bind_conf->arg, bind_conf->file, bind_conf->line);
+				cfgerr |= ERR_ALERT | ERR_FATAL;
+			}
+			if (ca_file && !((ssl_conf && ssl_conf->no_ca_names) || bind_conf->ssl_conf.no_ca_names)) {
 				/* set CA names for client cert request, function returns void */
 				SSL_CTX_set_client_CA_list(ctx, SSL_dup_CA_list(ssl_get_client_ca_file(ca_file)));
 			}
@@ -8507,8 +8515,8 @@ smp_fetch_ssl_c_verify(const struct arg *args, struct sample *smp, const char *k
 	return 1;
 }
 
-/* parse the "ca-file" bind keyword */
-static int ssl_bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, char **err)
+/* for ca-file and ca-no-names-file */
+static int ssl_bind_parse_ca_file_common(char **args, int cur_arg, char **ca_file_p, char **err)
 {
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing CAfile path", args[cur_arg]);
@@ -8516,19 +8524,35 @@ static int ssl_bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, st
 	}
 
 	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
-		memprintf(&conf->ca_file, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
+		memprintf(ca_file_p, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
-		memprintf(&conf->ca_file, "%s", args[cur_arg + 1]);
+		memprintf(ca_file_p, "%s", args[cur_arg + 1]);
 
-	if (!ssl_store_load_locations_file(conf->ca_file)) {
-		memprintf(err, "'%s' : unable to load %s", args[cur_arg], conf->ca_file);
+	if (!ssl_store_load_locations_file(*ca_file_p)) {
+		memprintf(err, "'%s' : unable to load %s", args[cur_arg], *ca_file_p);
 		return ERR_ALERT | ERR_FATAL;
 	}
 	return 0;
 }
+
+/* parse the "ca-file" bind keyword */
+static int ssl_bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_ca_file_common(args, cur_arg, &conf->ca_file, err);
+}
 static int bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	return ssl_bind_parse_ca_file(args, cur_arg, px, &conf->ssl_conf, err);
+}
+
+/* parse the "ca-no-names-file" bind keyword */
+static int ssl_bind_parse_ca_no_names_file(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_ca_file_common(args, cur_arg, &conf->ca_no_names_file, err);
+}
+static int bind_parse_ca_no_names_file(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_ca_no_names_file(args, cur_arg, px, &conf->ssl_conf, err);
 }
 
 /* parse the "ca-sign-file" bind keyword */
@@ -11258,6 +11282,7 @@ static struct ssl_bind_kw ssl_bind_kws[] = {
 	{ "allow-0rtt",            ssl_bind_parse_allow_0rtt,       0 }, /* allow 0-RTT */
 	{ "alpn",                  ssl_bind_parse_alpn,             1 }, /* set ALPN supported protocols */
 	{ "ca-file",               ssl_bind_parse_ca_file,          1 }, /* set CAfile to process verify on client cert */
+	{ "ca-no-names-file",      ssl_bind_parse_ca_no_names_file, 1 }, /* set CA(no-names)file to process verify on client cert */
 	{ "ciphers",               ssl_bind_parse_ciphers,          1 }, /* set SSL cipher suite */
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
 	{ "ciphersuites",          ssl_bind_parse_ciphersuites,     1 }, /* set TLS 1.3 cipher suite */
@@ -11279,6 +11304,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "allow-0rtt",            bind_parse_allow_0rtt,         0 }, /* Allow 0RTT */
 	{ "alpn",                  bind_parse_alpn,               1 }, /* set ALPN supported protocols */
 	{ "ca-file",               bind_parse_ca_file,            1 }, /* set CAfile to process verify on client cert */
+	{ "ca-no-names-file",      bind_parse_ca_no_names_file,   1 }, /* set CA(no-names)file to process verify on client cert */
 	{ "ca-ignore-err",         bind_parse_ignore_err,         1 }, /* set error IDs to ignore on verify depth > 0 */
 	{ "ca-sign-file",          bind_parse_ca_sign_file,       1 }, /* set CAFile used to generate and sign server certs */
 	{ "ca-sign-pass",          bind_parse_ca_sign_pass,       1 }, /* set CAKey passphrase */

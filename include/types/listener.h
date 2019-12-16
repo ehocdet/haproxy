@@ -128,6 +128,7 @@ struct ssl_bind_conf {
 	int no_ca_names:1;         /* do not send ca names to clients (ca_file related) */
 	int early_data:1;          /* early data allowed */
 	char *ca_file;             /* CAfile to use on verify */
+	char *ca_no_names_file;    /* CA(no-names)file to use on verify */
 	char *crl_file;            /* CRLfile to use on verify */
 	char *ciphers;             /* cipher suite to use if non-null */
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
