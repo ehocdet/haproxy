@@ -153,6 +153,7 @@ int nb_engines = 0;
 static struct {
 	char *crt_base;             /* base directory path for certificates */
 	char *ca_base;              /* base directory path for CAs and CRLs */
+	char *chain_base;           /* base directory path for chain */
 	int  async;                 /* whether we use ssl async mode */
 
 	char *listen_default_ciphers;
@@ -361,6 +362,87 @@ static struct {
 	struct ckch_store *old_ckchs;
 	char *path;
 } ckchs_transaction;
+
+
+/*
+  deduplicate chain
+*/
+
+struct chain_entry {
+	STACK_OF(X509) *chain;
+	struct ebmb_node node;
+	char path[0];
+};
+
+static struct eb_root chain_tree = EB_ROOT_UNIQUE;
+
+static STACK_OF(X509)* ssl_get0_chain_file(char *path)
+{
+	struct ebmb_node *eb;
+
+	eb = ebst_lookup(&chain_tree, path);
+	if (eb) {
+		struct chain_entry *chain_e;
+		chain_e = ebmb_entry(eb, struct chain_entry, node);
+		return chain_e->chain;
+	}
+	return NULL;
+}
+
+static int ssl_load_chain_from_BIO(BIO *in, char *path)
+{
+	X509 *ca;
+	STACK_OF(X509) *chain = NULL;
+	struct chain_entry *chain_e;
+	int pathlen;
+
+	while ((ca = PEM_read_bio_X509(in, NULL, NULL, NULL))) {
+		if (chain == NULL)
+			chain = sk_X509_new_null();
+		if (!sk_X509_push(chain, ca)) {
+			X509_free(ca);
+			goto end;
+		}
+	}
+	if (chain == NULL)
+		goto end;
+	pathlen = strlen(path);
+	chain_e = calloc(1, sizeof(*chain_e) + pathlen + 1);
+	if (chain_e) {
+		memcpy(chain_e->path, path, pathlen + 1);
+		chain_e->chain = chain;
+		ebst_insert(&chain_tree, &chain_e->node);
+		return 1;
+	}
+ end:
+	if (chain)
+		sk_X509_pop_free(chain, X509_free);
+	return 0;
+}
+
+static int ssl_load_chain_file(char *path)
+{
+	if (ssl_get0_chain_file(path) == NULL) {
+		int ret = 0;
+		struct stat buf;
+		BIO *in = NULL;
+		if (stat(path, &buf) != 0)
+			goto end;
+		if (!S_ISREG(buf.st_mode))
+			goto end;
+		in = BIO_new(BIO_s_file());
+		if (in == NULL)
+			goto end;
+		if (BIO_read_filename(in, path) <= 0)
+			goto end;
+		ret = ssl_load_chain_from_BIO(in, path);
+	end:
+		if (in)
+			BIO_free(in);
+		return ret;
+	}
+	return 1;
+}
 
 /*
  * deduplicate cafile (and crlfile)
@@ -8523,6 +8605,30 @@ smp_fetch_ssl_c_verify(const struct arg *args, struct sample *smp, const char *k
 	return 1;
 }
 
+/* parse the "chain" bind keyword */
+static int ssl_bind_parse_chain(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, char **err)
+{
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing chain path", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if ((*args[cur_arg + 1] != '/') && global_ssl.chain_base)
+		memprintf(&conf->chain_file, "%s/%s", global_ssl.chain_base, args[cur_arg + 1]);
+	else
+		memprintf(&conf->chain_file, "%s", args[cur_arg + 1]);
+
+	if (!ssl_load_chain_file(conf->chain_file)) {
+		memprintf(err, "'%s' : unable to load %s", args[cur_arg], conf->chain_file);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+}
+static int bind_parse_chain(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_chain(args, cur_arg, px, &conf->ssl_conf, err);
+}
+
 /* parse the "ca-file" bind keyword */
 static int ssl_bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, char **err)
 {
@@ -9642,7 +9748,8 @@ static int ssl_parse_global_ca_crt_base(char **args, int section_type, struct pr
 {
 	char **target;
 
-	target = (args[0][1] == 'a') ? &global_ssl.ca_base : &global_ssl.crt_base;
+	target = (args[0][1] == 'a') ? &global_ssl.ca_base :
+		(args[0][1] == 'h') ? &global_ssl.chain_base : &global_ssl.crt_base;
 
 	if (too_many_args(1, args, err, NULL))
 		return -1;
@@ -11264,6 +11371,7 @@ static struct ssl_bind_kw ssl_bind_kws[] = {
 	{ "allow-0rtt",            ssl_bind_parse_allow_0rtt,       0 }, /* allow 0-RTT */
 	{ "alpn",                  ssl_bind_parse_alpn,             1 }, /* set ALPN supported protocols */
 	{ "ca-file",               ssl_bind_parse_ca_file,          1 }, /* set CAfile to process verify on client cert */
+	{ "chain",                 ssl_bind_parse_chain,            1 }, /* set chain for certificates */
 	{ "ciphers",               ssl_bind_parse_ciphers,          1 }, /* set SSL cipher suite */
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
 	{ "ciphersuites",          ssl_bind_parse_ciphersuites,     1 }, /* set TLS 1.3 cipher suite */
@@ -11285,6 +11393,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "allow-0rtt",            bind_parse_allow_0rtt,         0 }, /* Allow 0RTT */
 	{ "alpn",                  bind_parse_alpn,               1 }, /* set ALPN supported protocols */
 	{ "ca-file",               bind_parse_ca_file,            1 }, /* set CAfile to process verify on client cert */
+	{ "chain",                 bind_parse_chain,              1 }, /* set chain for certificates */
 	{ "ca-ignore-err",         bind_parse_ignore_err,         1 }, /* set error IDs to ignore on verify depth > 0 */
 	{ "ca-sign-file",          bind_parse_ca_sign_file,       1 }, /* set CAFile used to generate and sign server certs */
 	{ "ca-sign-pass",          bind_parse_ca_sign_pass,       1 }, /* set CAKey passphrase */
@@ -11379,6 +11488,7 @@ INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
 static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ca-base",  ssl_parse_global_ca_crt_base },
 	{ CFG_GLOBAL, "crt-base", ssl_parse_global_ca_crt_base },
+	{ CFG_GLOBAL, "chain-base", ssl_parse_global_ca_crt_base },
 	{ CFG_GLOBAL, "maxsslconn", ssl_parse_global_int },
 	{ CFG_GLOBAL, "ssl-default-bind-options", ssl_parse_default_bind_options },
 	{ CFG_GLOBAL, "ssl-default-server-options", ssl_parse_default_server_options },
