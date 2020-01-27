@@ -3432,11 +3432,6 @@ static int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct cert_
 		}
 	}
 
-	/* no chain */
-	if (chain == NULL) {
-		chain = sk_X509_new_null();
-	}
-
 	ret = ERR_get_error();
 	if (ret && (ERR_GET_LIB(ret) != ERR_LIB_PEM && ERR_GET_REASON(ret) != PEM_R_NO_START_LINE)) {
 		memprintf(err, "%sunable to load certificate chain from file '%s'.\n",
@@ -3605,9 +3600,11 @@ end:
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
-static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_and_chain *ckch, SSL_CTX *ctx, char **err)
+static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_and_chain *ckch,
+				      char *chain_file, SSL_CTX *ctx, char **err)
 {
 	int errcode = 0;
+	STACK_OF(X509) *ovch;
 
 	if (SSL_CTX_use_PrivateKey(ctx, ckch->key) <= 0) {
 		memprintf(err, "%sunable to load SSL private key into SSL Context '%s'.\n",
@@ -3623,9 +3620,11 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
 		goto end;
 	}
 
+	/* take the chain in cert PEM first, else the shared chain */
+	ovch = ckch->chain ? ckch->chain : (chain_file ? ssl_get0_chain_file(chain_file) : NULL);
 	/* Load all certs in the ckch into the ctx_chain for the ssl_ctx */
 #ifdef SSL_CTX_set1_chain
-        if (!SSL_CTX_set1_chain(ctx, ckch->chain)) {
+        if (!SSL_CTX_set1_chain(ctx, ovch)) {
 		memprintf(err, "%sunable to load chain certificate into SSL Context '%s'. Make sure you are linking against Openssl >= 1.0.2.\n",
 			  err && *err ? *err : "", path);
 		errcode |= ERR_ALERT | ERR_FATAL;
@@ -3635,7 +3634,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
 	{ /* legacy compat (< openssl 1.0.2) */
 		X509 *ca;
 		STACK_OF(X509) *chain;
-		chain = X509_chain_up_ref(ckch->chain);
+		chain = X509_chain_up_ref(ovch);
 		while ((ca = sk_X509_shift(chain)))
 			if (!SSL_CTX_add_extra_chain_cert(ctx, ca)) {
 				memprintf(err, "%sunable to load chain certificate into SSL Context '%s'.\n",
@@ -4050,6 +4049,7 @@ static int ckch_inst_new_load_multi_store(const char *path, struct ckch_store *c
 		cur_ctx = key_combos[i-1].ctx;
 
 		if (cur_ctx == NULL) {
+			char *chain_file;
 			/* need to create SSL_CTX */
 			cur_ctx = SSL_CTX_new(SSLv23_server_method());
 			if (cur_ctx == NULL) {
@@ -4058,13 +4058,15 @@ static int ckch_inst_new_load_multi_store(const char *path, struct ckch_store *c
 				errcode |= ERR_ALERT | ERR_FATAL;
 				goto end;
 			}
+			/* get the chain_file */
+			chain_file = (ssl_conf && ssl_conf->chain_file) ? ssl_conf->chain_file : bind_conf->ssl_conf.chain_file;
 
 			/* Load all required certs/keys/chains/OCSPs info into SSL_CTX */
 			for (n = 0; n < SSL_SOCK_NUM_KEYTYPES; n++) {
 				if (i & (1<<n)) {
 					/* Key combo contains ckch[n] */
 					snprintf(cur_file, MAXPATHLEN+1, "%s.%s", path, SSL_SOCK_KEYTYPE_NAMES[n]);
-					errcode |= ssl_sock_put_ckch_into_ctx(cur_file, &certs_and_keys[n], cur_ctx, err);
+					errcode |= ssl_sock_put_ckch_into_ctx(cur_file, &certs_and_keys[n], chain_file, cur_ctx, err);
 					if (errcode & ERR_CODE)
 						goto end;
 				}
@@ -4165,6 +4167,7 @@ static int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, 
 	int i;
 	int order = 0;
 	X509_NAME *xname;
+	char *chain_file;
 	char *str;
 	EVP_PKEY *pkey;
 	struct pkey_info kinfo = { .sig = TLSEXT_signature_anonymous, .bits = 0 };
@@ -4193,8 +4196,9 @@ static int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, 
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto error;
 	}
-
-	errcode |= ssl_sock_put_ckch_into_ctx(path, ckch, ctx, err);
+	/* get the chain_file */
+	chain_file = (ssl_conf && ssl_conf->chain_file) ? ssl_conf->chain_file : bind_conf->ssl_conf.chain_file;
+	errcode |= ssl_sock_put_ckch_into_ctx(path, ckch, chain_file, ctx, err);
 	if (errcode & ERR_CODE)
 		goto error;
 
